@@ -1,0 +1,50 @@
+name: Preview first PDF pages
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/pdf-preview.yml"
+      - "1____introduzizone_CL_DISI_L1.pdf"
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Render first five pages as images
+        run: |
+          python -m pip install --quiet pymupdf
+          python - <<'PY'
+          import fitz
+          from pathlib import Path
+
+          pdf_path = Path("1____introduzizone_CL_DISI_L1.pdf")
+          out = Path("pdf-preview")
+          out.mkdir(exist_ok=True)
+          doc = fitz.open(pdf_path)
+          count = min(5, len(doc))
+          for i in range(count):
+              page = doc.load_page(i)
+              pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+              pix.save(out / f"page-{i+1:02d}.png")
+          print(f"Rendered {count} of {len(doc)} pages.")
+          PY
+
+      - name: Upload page images
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf-first-pages
+          path: pdf-preview/*.png
+          if-no-files-found: error
+          retention-days: 3
