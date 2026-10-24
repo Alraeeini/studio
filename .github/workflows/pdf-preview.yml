@@ -21,7 +21,7 @@ on:
   push:
     paths:
       - "**.pdf"
-      - ".github/workflows/pdf-preview.yml"
+      - "study-request.json"
 
 permissions:
   contents: read
@@ -53,104 +53,116 @@ jobs:
           INPUT_PAGE_COUNT: ${{ inputs.page_count || 5 }}
         run: |
           python - <<'PY'
+          import json
           import os
           import re
           import subprocess
           from pathlib import Path
 
           import fitz
-          from PIL import Image, ImageDraw, ImageFont
+          from PIL import Image, ImageDraw
 
           root = Path.cwd().resolve()
           event_name = os.environ.get("EVENT_NAME", "push")
           selected_path = os.environ.get("INPUT_PDF_PATH", "").strip()
           start_page = max(1, int(float(os.environ.get("INPUT_START_PAGE", "1") or "1")))
           page_count = max(1, min(10, int(float(os.environ.get("INPUT_PAGE_COUNT", "5") or "5"))))
+          include_overview = True
 
           if event_name == "workflow_dispatch":
               candidates = [Path(selected_path)]
           else:
               before = os.environ.get("EVENT_BEFORE", "")
               after = os.environ.get("EVENT_SHA", "HEAD")
-              if before and not set(before) <= {"0"}:
+              changed_files = []
+              if before and set(before) != {"0"}:
                   result = subprocess.run(
                       ["git", "diff", "--name-only", "--diff-filter=ACMR", before, after],
                       check=True, capture_output=True, text=True,
                   )
-                  candidates = [Path(line) for line in result.stdout.splitlines()
-                                if line.lower().endswith(".pdf")]
+                  changed_files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+              changed_pdfs = [Path(p) for p in changed_files if p.lower().endswith(".pdf")]
+              if changed_pdfs:
+                  # When a new PDF is uploaded, preview its opening pages and map the whole document.
+                  candidates = changed_pdfs
+                  start_page, page_count = 1, 5
+                  include_overview = True
+              elif "study-request.json" in changed_files:
+                  # The assistant can request any page range by updating this tiny control file.
+                  request = json.loads((root / "study-request.json").read_text(encoding="utf-8"))
+                  candidates = [Path(request["pdf_path"])]
+                  start_page = max(1, int(request.get("start_page", 1)))
+                  page_count = max(1, min(10, int(request.get("page_count", 5))))
+                  include_overview = bool(request.get("include_overview", False))
               else:
-                  candidates = list(root.rglob("*.pdf"))
+                  # Fallback for first-time runs or unusual repository events.
+                  candidates = sorted(root.rglob("*.pdf"))
+                  start_page, page_count = 1, 5
+                  include_overview = True
 
           if not candidates:
-              # A workflow-file change should also validate the pipeline against the repository PDFs.
-              candidates = sorted(root.rglob("*.pdf"))
-          if not candidates:
-              raise SystemExit("No PDF was found. For a manual run, enter its repository path.")
+              raise SystemExit("No PDF was found. Check the PDF path or the study-request.json file.")
 
           out_root = root / "study-materials"
           out_root.mkdir(exist_ok=True)
           rendered_docs = 0
 
-          for relative in candidates:
-              pdf_path = (root / relative).resolve()
+          for candidate in candidates:
+              pdf_path = (root / candidate).resolve()
               if root not in pdf_path.parents:
-                  raise SystemExit(f"Refusing a path outside the repository: {relative}")
+                  raise SystemExit(f"Refusing a path outside the repository: {candidate}")
               if pdf_path.suffix.lower() != ".pdf" or not pdf_path.is_file():
-                  raise SystemExit(f"PDF not found: {relative}")
+                  raise SystemExit(f"PDF not found: {candidate}")
 
+              relative_path = Path(os.path.relpath(pdf_path, root))
               doc = fitz.open(pdf_path)
               if doc.page_count == 0:
-                  raise SystemExit(f"PDF has no pages: {relative}")
+                  raise SystemExit(f"PDF has no pages: {relative_path}")
 
-              stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(relative.with_suffix(""))).strip("._")
+              stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(relative_path.with_suffix(""))).strip("._")
               doc_out = out_root / (stem or "document")
               pages_out = doc_out / "pages"
-              overview_out = doc_out / "overview"
               pages_out.mkdir(parents=True, exist_ok=True)
-              overview_out.mkdir(parents=True, exist_ok=True)
 
-              # On a PDF upload, preview the opening pages. Manual runs can select any range.
-              first = start_page if event_name == "workflow_dispatch" else 1
-              count = page_count if event_name == "workflow_dispatch" else 5
-              last = min(doc.page_count, first + count - 1)
+              first = start_page
+              last = min(doc.page_count, first + page_count - 1)
               if first > doc.page_count:
-                  raise SystemExit(
-                      f"Start page {first} is beyond the {doc.page_count}-page document: {relative}"
-                  )
+                  raise SystemExit(f"Start page {first} is beyond the {doc.page_count}-page document: {relative_path}")
 
               for page_num in range(first, last + 1):
                   page = doc.load_page(page_num - 1)
                   pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
-                  image_path = pages_out / f"page-{page_num:04d}.jpg"
-                  pix.save(str(image_path), jpg_quality=88)
+                  pix.save(str(pages_out / f"page-{page_num:04d}.jpg"), jpg_quality=88)
 
-              # Overview sheets show every page thumbnail so we can map topics before teaching.
-              thumbs_per_sheet = 20
-              columns, rows = 4, 5
-              cell_w, thumb_h, label_h = 360, 203, 28
-              for sheet_start in range(0, doc.page_count, thumbs_per_sheet):
-                  batch = range(sheet_start, min(sheet_start + thumbs_per_sheet, doc.page_count))
-                  sheet = Image.new("RGB", (columns * cell_w, rows * (thumb_h + label_h)), "white")
-                  draw = ImageDraw.Draw(sheet)
-                  for slot, page_index in enumerate(batch):
-                      page = doc.load_page(page_index)
-                      pix = page.get_pixmap(matrix=fitz.Matrix(0.32, 0.32), alpha=False)
-                      thumb = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                      thumb.thumbnail((cell_w - 8, thumb_h - 4))
-                      x = (slot % columns) * cell_w
-                      y = (slot // columns) * (thumb_h + label_h)
-                      sheet.paste(thumb, (x + (cell_w - thumb.width) // 2, y))
-                      draw.text((x + 6, y + thumb_h), f"Page {page_index + 1}", fill="black")
-                  sheet.save(overview_out / f"overview-{sheet_start // thumbs_per_sheet + 1:03d}.jpg",
-                             quality=86, optimize=True)
+              if include_overview:
+                  overview_out = doc_out / "overview"
+                  overview_out.mkdir(parents=True, exist_ok=True)
+                  thumbs_per_sheet = 20
+                  columns, rows = 4, 5
+                  cell_w, thumb_h, label_h = 360, 203, 28
+                  for sheet_start in range(0, doc.page_count, thumbs_per_sheet):
+                      batch = range(sheet_start, min(sheet_start + thumbs_per_sheet, doc.page_count))
+                      sheet = Image.new("RGB", (columns * cell_w, rows * (thumb_h + label_h)), "white")
+                      draw = ImageDraw.Draw(sheet)
+                      for slot, page_index in enumerate(batch):
+                          page = doc.load_page(page_index)
+                          pix = page.get_pixmap(matrix=fitz.Matrix(0.32, 0.32), alpha=False)
+                          thumb = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                          thumb.thumbnail((cell_w - 8, thumb_h - 4))
+                          x = (slot % columns) * cell_w
+                          y = (slot // columns) * (thumb_h + label_h)
+                          sheet.paste(thumb, (x + (cell_w - thumb.width) // 2, y))
+                          draw.text((x + 6, y + thumb_h), f"Page {page_index + 1}", fill="black")
+                      sheet.save(overview_out / f"overview-{sheet_start // thumbs_per_sheet + 1:03d}.jpg",
+                                 quality=86, optimize=True)
 
               summary = (
-                  f"PDF: {relative}\n"
+                  f"PDF: {relative_path}\n"
                   f"Total pages: {doc.page_count}\n"
                   f"Full-size page previews: {first}-{last}\n"
-                  f"All-page overview: {doc.page_count} pages, in sheets of up to 20\n"
-                  "No text extraction performed; the study previews are rendered from original PDF pages.\n"
+                  + (f"All-page overview: {doc.page_count} pages, in sheets of up to 20\n" if include_overview else "")
+                  + "No text extraction performed; pages are rendered from the original PDF.\n"
               )
               (doc_out / "README.txt").write_text(summary, encoding="utf-8")
               print(summary)
