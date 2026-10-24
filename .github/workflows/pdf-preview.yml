@@ -21,6 +21,7 @@ on:
   push:
     paths:
       - "**.pdf"
+      - ".github/workflows/pdf-preview.yml"
 
 permissions:
   contents: read
@@ -82,7 +83,10 @@ jobs:
                   candidates = list(root.rglob("*.pdf"))
 
           if not candidates:
-              raise SystemExit("No changed PDF was found. For a manual run, enter its repository path.")
+              # A workflow-file change should also validate the pipeline against the repository PDFs.
+              candidates = sorted(root.rglob("*.pdf"))
+          if not candidates:
+              raise SystemExit("No PDF was found. For a manual run, enter its repository path.")
 
           out_root = root / "study-materials"
           out_root.mkdir(exist_ok=True)
