@@ -1,50 +1,165 @@
-name: Preview first PDF pages
+name: Prepare study pages from PDFs
 
 on:
   workflow_dispatch:
+    inputs:
+      pdf_path:
+        description: "Repository path of the PDF to study"
+        required: true
+        type: string
+        default: "1____introduzizone_CL_DISI_L1.pdf"
+      start_page:
+        description: "First page to render (1-based)"
+        required: true
+        type: number
+        default: 1
+      page_count:
+        description: "Number of full-size pages to render (1-10)"
+        required: true
+        type: number
+        default: 5
   push:
     paths:
-      - ".github/workflows/pdf-preview.yml"
-      - "1____introduzizone_CL_DISI_L1.pdf"
+      - "**.pdf"
 
 permissions:
   contents: read
 
 jobs:
-  render:
+  prepare:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Render first five pages as images
+      - name: Install PDF rendering tools
+        run: python -m pip install --quiet pymupdf pillow
+
+      - name: Render study pages and document overviews
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_PDF_PATH: ${{ inputs.pdf_path }}
+          INPUT_START_PAGE: ${{ inputs.start_page || 1 }}
+          INPUT_PAGE_COUNT: ${{ inputs.page_count || 5 }}
         run: |
-          python -m pip install --quiet pymupdf
           python - <<'PY'
-          import fitz
+          import os
+          import re
+          import subprocess
           from pathlib import Path
 
-          pdf_path = Path("1____introduzizone_CL_DISI_L1.pdf")
-          out = Path("pdf-preview")
-          out.mkdir(exist_ok=True)
-          doc = fitz.open(pdf_path)
-          count = min(5, len(doc))
-          for i in range(count):
-              page = doc.load_page(i)
-              pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-              pix.save(out / f"page-{i+1:02d}.png")
-          print(f"Rendered {count} of {len(doc)} pages.")
+          import fitz
+          from PIL import Image, ImageDraw, ImageFont
+
+          root = Path.cwd().resolve()
+          event_name = os.environ.get("EVENT_NAME", "push")
+          selected_path = os.environ.get("INPUT_PDF_PATH", "").strip()
+          start_page = max(1, int(float(os.environ.get("INPUT_START_PAGE", "1") or "1")))
+          page_count = max(1, min(10, int(float(os.environ.get("INPUT_PAGE_COUNT", "5") or "5"))))
+
+          if event_name == "workflow_dispatch":
+              candidates = [Path(selected_path)]
+          else:
+              before = os.environ.get("EVENT_BEFORE", "")
+              after = os.environ.get("EVENT_SHA", "HEAD")
+              if before and not set(before) <= {"0"}:
+                  result = subprocess.run(
+                      ["git", "diff", "--name-only", "--diff-filter=ACMR", before, after],
+                      check=True, capture_output=True, text=True,
+                  )
+                  candidates = [Path(line) for line in result.stdout.splitlines()
+                                if line.lower().endswith(".pdf")]
+              else:
+                  candidates = list(root.rglob("*.pdf"))
+
+          if not candidates:
+              raise SystemExit("No changed PDF was found. For a manual run, enter its repository path.")
+
+          out_root = root / "study-materials"
+          out_root.mkdir(exist_ok=True)
+          rendered_docs = 0
+
+          for relative in candidates:
+              pdf_path = (root / relative).resolve()
+              if root not in pdf_path.parents:
+                  raise SystemExit(f"Refusing a path outside the repository: {relative}")
+              if pdf_path.suffix.lower() != ".pdf" or not pdf_path.is_file():
+                  raise SystemExit(f"PDF not found: {relative}")
+
+              doc = fitz.open(pdf_path)
+              if doc.page_count == 0:
+                  raise SystemExit(f"PDF has no pages: {relative}")
+
+              stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(relative.with_suffix(""))).strip("._")
+              doc_out = out_root / (stem or "document")
+              pages_out = doc_out / "pages"
+              overview_out = doc_out / "overview"
+              pages_out.mkdir(parents=True, exist_ok=True)
+              overview_out.mkdir(parents=True, exist_ok=True)
+
+              # On a PDF upload, preview the opening pages. Manual runs can select any range.
+              first = start_page if event_name == "workflow_dispatch" else 1
+              count = page_count if event_name == "workflow_dispatch" else 5
+              last = min(doc.page_count, first + count - 1)
+              if first > doc.page_count:
+                  raise SystemExit(
+                      f"Start page {first} is beyond the {doc.page_count}-page document: {relative}"
+                  )
+
+              for page_num in range(first, last + 1):
+                  page = doc.load_page(page_num - 1)
+                  pix = page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False)
+                  image_path = pages_out / f"page-{page_num:04d}.jpg"
+                  pix.save(str(image_path), jpg_quality=88)
+
+              # Overview sheets show every page thumbnail so we can map topics before teaching.
+              thumbs_per_sheet = 20
+              columns, rows = 4, 5
+              cell_w, thumb_h, label_h = 360, 203, 28
+              for sheet_start in range(0, doc.page_count, thumbs_per_sheet):
+                  batch = range(sheet_start, min(sheet_start + thumbs_per_sheet, doc.page_count))
+                  sheet = Image.new("RGB", (columns * cell_w, rows * (thumb_h + label_h)), "white")
+                  draw = ImageDraw.Draw(sheet)
+                  for slot, page_index in enumerate(batch):
+                      page = doc.load_page(page_index)
+                      pix = page.get_pixmap(matrix=fitz.Matrix(0.32, 0.32), alpha=False)
+                      thumb = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                      thumb.thumbnail((cell_w - 8, thumb_h - 4))
+                      x = (slot % columns) * cell_w
+                      y = (slot // columns) * (thumb_h + label_h)
+                      sheet.paste(thumb, (x + (cell_w - thumb.width) // 2, y))
+                      draw.text((x + 6, y + thumb_h), f"Page {page_index + 1}", fill="black")
+                  sheet.save(overview_out / f"overview-{sheet_start // thumbs_per_sheet + 1:03d}.jpg",
+                             quality=86, optimize=True)
+
+              summary = (
+                  f"PDF: {relative}\n"
+                  f"Total pages: {doc.page_count}\n"
+                  f"Full-size page previews: {first}-{last}\n"
+                  f"All-page overview: {doc.page_count} pages, in sheets of up to 20\n"
+                  "No text extraction performed; the study previews are rendered from original PDF pages.\n"
+              )
+              (doc_out / "README.txt").write_text(summary, encoding="utf-8")
+              print(summary)
+              rendered_docs += 1
+              doc.close()
+
+          print(f"Prepared study material for {rendered_docs} PDF(s).")
           PY
 
-      - name: Upload page images
+      - name: Upload study material
         uses: actions/upload-artifact@v4
         with:
-          name: pdf-first-pages
-          path: pdf-preview/*.png
+          name: study-materials
+          path: study-materials/
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
