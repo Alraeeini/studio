@@ -7,7 +7,7 @@ on:
         description: "Repository path of the PDF to study"
         required: true
         type: string
-        default: "1____introduzizone_CL_DISI_L1.pdf"
+        default: "studio/Computer Logic/1____introduzizone_CL_DISI_L1.pdf"
       start_page:
         description: "First page to render (1-based)"
         required: true
@@ -20,7 +20,8 @@ on:
         default: 5
   push:
     paths:
-      - "**.pdf"
+      - "*.pdf"
+      - "**/*.pdf"
       - "study-request.json"
 
 permissions:
